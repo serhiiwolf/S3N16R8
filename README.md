@@ -40,8 +40,8 @@ For more information on structure and contents of ESP-IDF projects, please refer
 
 * Program upload failure
 
-    * Hardware connection is not correct: run `idf.py -p PORT monitor`, and reboot your board to see if there are any output logs.
-    * The baud rate for downloading is too high: lower your baud rate in the `menuconfig` menu, and try again.
+	* Hardware connection is not correct: run `idf.py -p PORT monitor`, and reboot your board to see if there are any output logs.
+	* The baud rate for downloading is too high: lower your baud rate in the `menuconfig` menu, and try again.
 
 ## Technical support and feedback
 
@@ -51,3 +51,4 @@ Please use the following feedback channels:
 * For a feature request or bug report, create a [GitHub issue](https://github.com/espressif/esp-idf/issues)
 
 We will get back to you as soon as possible.
+
