@@ -1,0 +1,19 @@
+# ESP-IDF build artifacts
+build/
+
+# Local SDK config backup
+sdkconfig.old
+
+# IDE/editor local settings
+.vscode/
+.settings/
+.cproject
+.project
+
+# Python cache
+__pycache__/
+*.py[cod]
+
+# OS junk
+.DS_Store
+Thumbs.db
