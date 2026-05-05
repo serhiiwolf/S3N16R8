@@ -35,12 +35,11 @@
 #define BMP280_ADDR_PRIMARY 0x76
 #define BMP280_ADDR_SECONDARY 0x77
 
-#define MQTT_TOPIC_GET_TEMP     "getters/Temp"
-#define MQTT_TOPIC_GET_HUMIDITY "getters/HUMIDITY"
-#define MQTT_TOPIC_GET_PRESSURE "getters/PRESSURE"
-#define MQTT_TOPIC_GET_ALTITUDE "getters/ALTITUDE"
-
-#define MQTT_TOPIC_DATA_PREFIX   "data/"
+/* New MQTT topic scheme: Metrics/<metric>/<device_id>
+ * The device subscribes to: "Metrics/+/<device_id>"
+ * When it receives a request on that topic it replies to the same topic.
+ */
+#define MQTT_TOPIC_METRICS_PREFIX "Metrics"
 
 #define NVS_NAMESPACE "appcfg"
 #define NVS_KEY_CFG   "mqtt_cfg"
@@ -84,6 +83,115 @@ static int s_wifi_retry_num = 0;
 static app_user_config_t s_user_cfg;
 static sensor_context_t s_sensors;
 static esp_mqtt_client_handle_t s_mqtt_client;
+
+static void mqtt_publish_json_to_topic(const char *topic, int topic_len, const char *type, const char *data_json)
+{
+    if (s_mqtt_client == NULL) {
+        ESP_LOGW(TAG, "MQTT client not ready, skip publish to %.*s", topic_len, topic);
+        return;
+    }
+
+    char topic_buf[128] = {0};
+    if (topic_len >= (int)sizeof(topic_buf)) {
+        ESP_LOGW(TAG, "Topic too long, skip publish");
+        return;
+    }
+    memcpy(topic_buf, topic, topic_len);
+    topic_buf[topic_len] = '\0';
+
+    char payload[192];
+    snprintf(payload, sizeof(payload), "{\"type\":\"%s\",\"data\":%s}", type, data_json);
+
+    int msg_id = esp_mqtt_client_publish(s_mqtt_client, topic_buf, payload, 0, 1, 0);
+    ESP_LOGI(TAG, "Published %s (%d): %s", topic_buf, msg_id, payload);
+}
+
+static bool parse_metrics_topic(const char *topic, int topic_len, char *metric_out, size_t metric_out_len)
+{
+    const char *prefix = MQTT_TOPIC_METRICS_PREFIX "/";
+    size_t prefix_len = strlen(prefix);
+    if (topic_len <= (int)prefix_len + 2) {
+        return false;
+    }
+
+    if (topic_len < (int)prefix_len) {
+        return false;
+    }
+
+    if (strncmp(topic, prefix, prefix_len) != 0) {
+        return false;
+    }
+
+    /* find the next '/' that separates metric and device id */
+    int i = (int)prefix_len;
+    int slash_pos = -1;
+    for (; i < topic_len; i++) {
+        if (topic[i] == '/') {
+            slash_pos = i;
+            break;
+        }
+    }
+    if (slash_pos <= 0) {
+        return false;
+    }
+
+    int metric_len = slash_pos - (int)prefix_len;
+    int device_len = topic_len - (slash_pos + 1);
+    if (metric_len <= 0 || device_len <= 0) {
+        return false;
+    }
+
+    /* verify device id matches configured id */
+    if ((size_t)device_len != strlen(s_user_cfg.device_id)) {
+        return false;
+    }
+    if (strncmp(&topic[slash_pos + 1], s_user_cfg.device_id, device_len) != 0) {
+        return false;
+    }
+
+    /* copy metric */
+    if ((size_t)metric_len >= metric_out_len) {
+        return false;
+    }
+    memcpy(metric_out, &topic[prefix_len], metric_len);
+    metric_out[metric_len] = '\0';
+    return true;
+}
+
+static bool is_metrics_request_payload(const char *payload, int payload_len)
+{
+    if (payload == NULL || payload_len == 0) {
+        return true;
+    }
+
+    int i = 0;
+    while (i < payload_len && (payload[i] == ' ' || payload[i] == '\t' || payload[i] == '\r' || payload[i] == '\n')) {
+        i++;
+    }
+
+    if (i >= payload_len) {
+        return true;
+    }
+
+    /* Ignore JSON payloads (our own responses), so we don't trigger reply loops. */
+    if (payload[i] == '{' || payload[i] == '[') {
+        return false;
+    }
+
+    const int remaining = payload_len - i;
+    if (remaining == 3 &&
+        (payload[i] == 'g' || payload[i] == 'G') &&
+        (payload[i + 1] == 'e' || payload[i + 1] == 'E') &&
+        (payload[i + 2] == 't' || payload[i + 2] == 'T')) {
+        return true;
+    }
+
+    if (remaining == 1 && payload[i] == '1') {
+        return true;
+    }
+
+    return false;
+}
 
 static bool is_config_reset_requested(void)
 {
@@ -206,40 +314,6 @@ static int16_t read_s16_le(const uint8_t *data)
     return (int16_t)read_u16_le(data);
 }
 
-static bool topic_matches(const char *topic, int topic_len, const char *expected)
-{
-    size_t expected_len = strlen(expected);
-    return topic_len == (int)expected_len && memcmp(topic, expected, expected_len) == 0;
-}
-
-static void mqtt_publish_json_raw(const char *topic_suffix, const char *type, const char *data_json)
-{
-    if (s_mqtt_client == NULL) {
-        ESP_LOGW(TAG, "MQTT client not ready, skip publish to %s", topic_suffix);
-        return;
-    }
-
-    char topic[96];
-    char payload[192];
-
-    snprintf(topic, sizeof(topic), "%s%s", MQTT_TOPIC_DATA_PREFIX, topic_suffix);
-    snprintf(payload, sizeof(payload), "{\"type\":\"%s\",\"data\":%s}", type, data_json);
-
-    int msg_id = esp_mqtt_client_publish(s_mqtt_client, topic, payload, 0, 1, 0);
-    ESP_LOGI(TAG, "Published %s (%d): %s", topic, msg_id, payload);
-}
-
-static void mqtt_publish_json_float(const char *topic_suffix, const char *type, float value, int precision)
-{
-    char data_json[32];
-    snprintf(data_json, sizeof(data_json), "%.*f", precision, value);
-    mqtt_publish_json_raw(topic_suffix, type, data_json);
-}
-
-static void mqtt_publish_json_error(const char *topic_suffix, const char *type)
-{
-    mqtt_publish_json_raw(topic_suffix, type, "\"read_error\"");
-}
 
 static esp_err_t i2c_write_reg(i2c_master_dev_handle_t dev, uint8_t reg, uint8_t value)
 {
@@ -465,45 +539,67 @@ static esp_err_t sensor_init(void)
     return ESP_OK;
 }
 
-static void handle_getter_topic(const char *topic, int topic_len)
+static void handle_metrics_topic(const char *topic, int topic_len, const char *payload, int payload_len)
 {
-    float temperature_c = 0.0f;
-    float humidity_rh = 0.0f;
-    float pressure_hpa = 0.0f;
-    float altitude_m = 0.0f;
-
     if (!s_sensors.initialized) {
         ESP_LOGE(TAG, "Sensors not initialized");
         return;
     }
 
-    if (topic_matches(topic, topic_len, MQTT_TOPIC_GET_TEMP)) {
+    if (!is_metrics_request_payload(payload, payload_len)) {
+        ESP_LOGD(TAG, "Ignored non-request payload on topic: %.*s", topic_len, topic);
+        return;
+    }
+
+    char metric[32];
+    if (!parse_metrics_topic(topic, topic_len, metric, sizeof(metric))) {
+        ESP_LOGW(TAG, "Ignored topic: %.*s", topic_len, topic);
+        return;
+    }
+
+    if (strcmp(metric, "status") == 0) {
+        return;
+    }
+
+    if (strcmp(metric, "Temp") == 0) {
+        float temperature_c = 0.0f;
         if (aht20_read(s_sensors.aht20, &temperature_c, NULL) == ESP_OK) {
-            mqtt_publish_json_float("Temp", "Temp", temperature_c, 2);
+            char data_json[32];
+            snprintf(data_json, sizeof(data_json), "%.*f", 2, temperature_c);
+            mqtt_publish_json_to_topic(topic, topic_len, "Temp", data_json);
         } else {
-            mqtt_publish_json_error("Temp", "Temp");
+            mqtt_publish_json_to_topic(topic, topic_len, "Temp", "\"read_error\"");
         }
-    } else if (topic_matches(topic, topic_len, MQTT_TOPIC_GET_HUMIDITY)) {
+    } else if (strcmp(metric, "HUMIDITY") == 0) {
+        float humidity_rh = 0.0f;
         if (aht20_read(s_sensors.aht20, NULL, &humidity_rh) == ESP_OK) {
-            mqtt_publish_json_float("HUMIDITY", "HUMIDITY", humidity_rh, 2);
+            char data_json[32];
+            snprintf(data_json, sizeof(data_json), "%.*f", 2, humidity_rh);
+            mqtt_publish_json_to_topic(topic, topic_len, "HUMIDITY", data_json);
         } else {
-            mqtt_publish_json_error("HUMIDITY", "HUMIDITY");
+            mqtt_publish_json_to_topic(topic, topic_len, "HUMIDITY", "\"read_error\"");
         }
-    } else if (topic_matches(topic, topic_len, MQTT_TOPIC_GET_PRESSURE)) {
+    } else if (strcmp(metric, "PRESSURE") == 0) {
+        float pressure_hpa = 0.0f;
         if (bmp280_read(s_sensors.bmp280, NULL, &pressure_hpa) == ESP_OK) {
-            mqtt_publish_json_float("PRESSURE", "PRESSURE", pressure_hpa, 2);
+            char data_json[32];
+            snprintf(data_json, sizeof(data_json), "%.*f", 2, pressure_hpa);
+            mqtt_publish_json_to_topic(topic, topic_len, "PRESSURE", data_json);
         } else {
-            mqtt_publish_json_error("PRESSURE", "PRESSURE");
+            mqtt_publish_json_to_topic(topic, topic_len, "PRESSURE", "\"read_error\"");
         }
-    } else if (topic_matches(topic, topic_len, MQTT_TOPIC_GET_ALTITUDE)) {
+    } else if (strcmp(metric, "ALTITUDE") == 0) {
+        float pressure_hpa = 0.0f;
         if (bmp280_read(s_sensors.bmp280, NULL, &pressure_hpa) == ESP_OK && pressure_hpa > 0.0f) {
-            altitude_m = 44330.0f * (1.0f - powf(pressure_hpa / 1013.25f, 0.1903f));
-            mqtt_publish_json_float("ALTITUDE", "ALTITUDE", altitude_m, 2);
+            float altitude_m = 44330.0f * (1.0f - powf(pressure_hpa / 1013.25f, 0.1903f));
+            char data_json[32];
+            snprintf(data_json, sizeof(data_json), "%.*f", 2, altitude_m);
+            mqtt_publish_json_to_topic(topic, topic_len, "ALTITUDE", data_json);
         } else {
-            mqtt_publish_json_error("ALTITUDE", "ALTITUDE");
+            mqtt_publish_json_to_topic(topic, topic_len, "ALTITUDE", "\"read_error\"");
         }
     } else {
-        ESP_LOGW(TAG, "Ignored topic: %.*s", topic_len, topic);
+        ESP_LOGW(TAG, "Unknown metric requested: %s", metric);
     }
 }
 
@@ -653,14 +749,15 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
             ESP_LOGI(TAG, "MQTT connected");
             s_mqtt_client = client;
 
-            esp_mqtt_client_subscribe(client, MQTT_TOPIC_GET_TEMP, 1);
-            esp_mqtt_client_subscribe(client, MQTT_TOPIC_GET_HUMIDITY, 1);
-            esp_mqtt_client_subscribe(client, MQTT_TOPIC_GET_PRESSURE, 1);
-            esp_mqtt_client_subscribe(client, MQTT_TOPIC_GET_ALTITUDE, 1);
+            /* Subscribe to Metric requests for this device: Metrics/+/<device_id> */
+            char final_sub[128];
+            snprintf(final_sub, sizeof(final_sub), "%s/+/%s", MQTT_TOPIC_METRICS_PREFIX, s_user_cfg.device_id);
+            esp_mqtt_client_subscribe(client, final_sub, 1);
 
+            /* publish status under Metrics/status/<device_id> */
             char status_topic[128];
             char status_payload[160];
-            snprintf(status_topic, sizeof(status_topic), "data/status");
+            snprintf(status_topic, sizeof(status_topic), "%s/status/%s", MQTT_TOPIC_METRICS_PREFIX, s_user_cfg.device_id);
             snprintf(status_payload, sizeof(status_payload), "{\"type\":\"status\",\"data\":{\"device_id\":\"%s\",\"state\":\"online\"}}", s_user_cfg.device_id);
             esp_mqtt_client_publish(client, status_topic, status_payload, 0, 1, 0);
             break;
@@ -671,7 +768,7 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
         case MQTT_EVENT_DATA:
             ESP_LOGI(TAG, "MQTT data on topic: %.*s", event->topic_len, event->topic);
             if (event->topic != NULL && event->topic_len > 0) {
-                handle_getter_topic(event->topic, event->topic_len);
+                handle_metrics_topic(event->topic, event->topic_len, event->data, event->data_len);
             }
             break;
         case MQTT_EVENT_DISCONNECTED:

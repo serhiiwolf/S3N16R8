@@ -7,34 +7,65 @@ ESP-IDF project for an interactive MQTT sensor node.
 
 (See the README.md file in the upper level 'examples' directory for more information about examples.)
 
-## How to use example
+## Overview
 
-Follow detailed instructions provided specifically for this example.
+This repository contains the "Interactive MQTT Sensor" firmware for ESP-IDF. The firmware reads environmental sensors over I2C and exposes their values via MQTT on demand. It is intended for development boards with an AHT20 (temperature & humidity) and a BMP280 (pressure) connected on the I2C bus.
 
-Select the instructions depending on Espressif chip installed on your development board:
+## Features
 
-- [ESP32 Getting Started Guide](https://docs.espressif.com/projects/esp-idf/en/stable/get-started/index.html)
-- [ESP32-S2 Getting Started Guide](https://docs.espressif.com/projects/esp-idf/en/latest/esp32s2/get-started/index.html)
+- Reads temperature and humidity from AHT20.
+- Reads pressure (and computes altitude) from BMP280.
+- Connects to Wi‑Fi and an MQTT broker.
+- Interactive bootstrap via serial console to enter Wi‑Fi and MQTT settings, saved to NVS.
+- Reset button clears saved configuration at boot (GPIO configured by `CONFIG_RESET_BUTTON_GPIO`).
+- Subscribes to metric request topics under `Metrics/<metric>/<device_id>` and replies on the same topic with JSON payloads.
 
+## MQTT Topics
 
-## Example folder contents
+- Request metric values by publishing to: `Metrics/<metric>/<device_id>`
+	- Example requests:
+		- `Metrics/Temp/<device_id>` with payload `get` — request temperature
+		- `Metrics/HUMIDITY/<device_id>` — request humidity
+		- `Metrics/PRESSURE/<device_id>` — request pressure
+		- `Metrics/ALTITUDE/<device_id>` — request altitude (computed from pressure)
+- The device subscribes to `Metrics/+/<device_id>` and replies on the same topic.
+- Request payload should be `get` (or empty/`1` for compatibility). JSON payloads are treated as responses and ignored to avoid MQTT feedback loops.
+- Response payloads are JSON objects with `type` and `data` fields, where `data` contains the numeric value or the string `"read_error"` on failure.
 
-The project **interactive_mqtt_sensor** contains one source file in C language [interactive_mqtt_sensor_main.c](main/interactive_mqtt_sensor_main.c). The file is located in folder [main](main).
+## Interactive Setup and Configuration
 
-ESP-IDF projects are built using CMake. The project build configuration is contained in `CMakeLists.txt` files that provide set of directives and instructions describing the project's source files and targets (executable, library, or both).
+- On first boot (or after clearing NVS by holding the reset button at boot), the device enters an interactive console setup where you must provide:
+	- Wi‑Fi SSID and password
+	- Broker URI (e.g. `mqtt://192.168.1.10:1883` or `wss://broker.example.com:443/mqtt`)
+	- MQTT client id and device id
+- The settings are stored in NVS under namespace `appcfg` so the device reconnects automatically on next boot.
 
-Below is short explanation of remaining files in the project folder.
+## Hardware
 
+- I2C SDA: GPIO 8
+- I2C SCL: GPIO 9
+- Reset button: GPIO defined by `CONFIG_RESET_BUTTON_GPIO` (default in project config)
+
+Refer to the firmware entrypoint and implementation: [main/interactive_mqtt_sensor_main.c](main/interactive_mqtt_sensor_main.c#L1-L999).
+
+## Build and Flash
+
+Build and flash using the ESP-IDF tooling from the project root:
+
+```bash
+idf.py build
+idf.py -p PORT flash
+idf.py -p PORT monitor
 ```
-├── CMakeLists.txt
-├── pytest_hello_world.py      Python script used for automated testing
-├── main
-│   ├── CMakeLists.txt
-│   └── interactive_mqtt_sensor_main.c
-└── README.md                  This is the file you are currently reading
-```
 
-For more information on structure and contents of ESP-IDF projects, please refer to Section [Build System](https://docs.espressif.com/projects/esp-idf/en/latest/esp32/api-guides/build-system.html) of the ESP-IDF Programming Guide.
+Replace `PORT` with your serial port (example: `COM3` on Windows).
+
+## Project files
+
+- [CMakeLists.txt](CMakeLists.txt#L1) — top-level build config
+- [main/interactive_mqtt_sensor_main.c](main/interactive_mqtt_sensor_main.c#L1) — firmware source
+
+If you need more details on ESP-IDF project structure and building, see the ESP-IDF Programming Guide: https://docs.espressif.com/projects/esp-idf/en/latest/esp32/get-started/
 
 ## Troubleshooting
 
