@@ -19,6 +19,7 @@ This repository contains the "Interactive MQTT Sensor" firmware for ESP-IDF. The
 - Interactive bootstrap via serial console to enter Wi‑Fi and MQTT settings, saved to NVS.
 - Reset button clears saved configuration at boot (GPIO configured by `CONFIG_RESET_BUTTON_GPIO`).
 - Subscribes to metric request topics under `Metrics/<metric>/<device_id>` and replies on the same topic with JSON payloads.
+- Supports OTA update over HTTPS, triggered by MQTT command.
 
 ## MQTT Topics
 
@@ -29,8 +30,21 @@ This repository contains the "Interactive MQTT Sensor" firmware for ESP-IDF. The
 		- `Metrics/PRESSURE/<device_id>` — request pressure
 		- `Metrics/ALTITUDE/<device_id>` — request altitude (computed from pressure)
 - The device subscribes to `Metrics/+/<device_id>` and replies on the same topic.
-- Request payload should be `get` (or empty/`1` for compatibility). JSON payloads are treated as responses and ignored to avoid MQTT feedback loops.
+- Request payload should be `get` (or empty/`1` for compatibility). JSON payloads are treate d as responses and ignored to avoid MQTT feedback loops.
 - Response payloads are JSON objects with `type` and `data` fields, where `data` contains the numeric value or the string `"read_error"` on failure.
+
+## OTA Over MQTT
+
+- OTA command topic: `OTA/update/<device_id>`
+- OTA status topic: `OTA/status/<device_id>`
+- Payload formats supported for OTA command:
+	- raw HTTPS URL string, example: `https://example.com/firmware.bin`
+	- JSON object, example: `{"url":"https://example.com/firmware.bin"}`
+
+Notes:
+- OTA download is allowed only from `https://` URLs.
+- The device publishes status transitions (`accepted`, `downloading`, `applied`, `failed`, `busy`) to `OTA/status/<device_id>`.
+- On successful update, the device reboots automatically.
 
 ## Interactive Setup and Configuration
 
