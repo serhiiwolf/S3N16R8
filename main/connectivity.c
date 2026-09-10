@@ -533,6 +533,8 @@ esp_err_t mqtt_start(const app_user_config_t *cfg)
         .broker.address.uri = cfg->broker_uri,
         .broker.verification.crt_bundle_attach = esp_crt_bundle_attach,
         .credentials.client_id = cfg->mqtt_client_id,
+        .credentials.username = cfg->mqtt_username,
+        .credentials.authentication.password = cfg->mqtt_password,
         .network.disable_auto_reconnect = false,
     };
 

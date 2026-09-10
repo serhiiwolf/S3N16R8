@@ -23,12 +23,13 @@ void app_main(void)
     ota_confirm_running_image();
 
     ESP_ERROR_CHECK(app_console_init());
-    ESP_ERROR_CHECK(sensor_init());
 
     if (app_is_config_reset_requested()) {
         ESP_LOGW(TAG, "Reset button pressed on GPIO%d: clearing saved config", 4);
         ESP_ERROR_CHECK(app_erase_user_config());
     }
+
+    ESP_ERROR_CHECK(sensor_init());
 
     if (app_load_user_config(&user_cfg) != ESP_OK) {
         ESP_LOGI(TAG, "Saved configuration not found, switching to interactive setup");

@@ -48,10 +48,10 @@ Notes:
 
 ## Interactive Setup and Configuration
 
-- On first boot (or after clearing NVS by holding the reset button at boot), the device enters an interactive console setup where you must provide:
+- On first boot (or after clearing NVS by holding the reset button on GPIO4 for at least 1 second at boot), the device enters an interactive console setup where you must provide:
 	- Wi‑Fi SSID and password
 	- Broker URI (e.g. `mqtt://192.168.1.10:1883` or `wss://broker.example.com:443/mqtt`)
-	- MQTT client id and device id
+	- MQTT client id, username, password, and device id
 - The settings are stored in NVS under namespace `appcfg` so the device reconnects automatically on next boot.
 
 ## Hardware
@@ -96,4 +96,3 @@ Please use the following feedback channels:
 * For a feature request or bug report, create a [GitHub issue](https://github.com/espressif/esp-idf/issues)
 
 We will get back to you as soon as possible.
-

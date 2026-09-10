@@ -89,8 +89,17 @@ bool app_is_config_reset_requested(void)
     };
     ESP_ERROR_CHECK(gpio_config(&io_cfg));
 
-    vTaskDelay(pdMS_TO_TICKS(30));
-    return gpio_get_level(CONFIG_RESET_BUTTON_GPIO) == 0;
+    if (gpio_get_level(CONFIG_RESET_BUTTON_GPIO) != 0) {
+        return false;
+    }
+
+    ESP_LOGW(TAG, "Reset button detected on GPIO%d; hold for 1 second to erase configuration",
+             CONFIG_RESET_BUTTON_GPIO);
+    vTaskDelay(pdMS_TO_TICKS(1000));
+
+    bool reset_requested = gpio_get_level(CONFIG_RESET_BUTTON_GPIO) == 0;
+    ESP_LOGI(TAG, "Configuration reset button state: %s", reset_requested ? "confirmed" : "cancelled");
+    return reset_requested;
 }
 
 esp_err_t app_save_user_config(const app_user_config_t *cfg)
@@ -130,7 +139,9 @@ esp_err_t app_load_user_config(app_user_config_t *cfg)
         return ESP_ERR_NVS_INVALID_LENGTH;
     }
 
-    if (strlen(cfg->wifi_ssid) == 0 || strlen(cfg->broker_uri) == 0 || strlen(cfg->mqtt_client_id) == 0) {
+    if (strlen(cfg->wifi_ssid) == 0 || strlen(cfg->broker_uri) == 0 ||
+        strlen(cfg->mqtt_client_id) == 0 || strlen(cfg->mqtt_username) == 0 ||
+        strlen(cfg->mqtt_password) == 0) {
         return ESP_ERR_INVALID_STATE;
     }
 
@@ -176,6 +187,14 @@ bool app_read_user_config_interactive(app_user_config_t *cfg)
     }
 
     if (!read_line_required("MQTT Client ID: ", cfg->mqtt_client_id, sizeof(cfg->mqtt_client_id))) {
+        return false;
+    }
+
+    if (!read_line_required("MQTT Username: ", cfg->mqtt_username, sizeof(cfg->mqtt_username))) {
+        return false;
+    }
+
+    if (!read_line_required("MQTT Password: ", cfg->mqtt_password, sizeof(cfg->mqtt_password))) {
         return false;
     }
 
