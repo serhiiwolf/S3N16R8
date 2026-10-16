@@ -9,12 +9,11 @@ ESP-IDF project for an interactive MQTT sensor node.
 
 ## Overview
 
-This repository contains the "Interactive MQTT Sensor" firmware for ESP-IDF. The firmware reads environmental sensors over I2C and exposes their values via MQTT on demand. It is intended for development boards with an AHT20 (temperature & humidity) and a BMP280 (pressure) connected on the I2C bus.
+This repository contains the "Interactive MQTT Sensor" firmware for ESP-IDF (AHT20-only variant). The firmware reads environmental sensors over I2C and exposes their values via MQTT on demand. It is intended for development boards with an AHT20 (temperature & humidity) connected on the I2C bus.
 
 ## Features
 
 - Reads temperature and humidity from AHT20.
-- Reads pressure (and computes altitude) from BMP280.
 - Connects to Wi‑Fi and an MQTT broker.
 - Interactive bootstrap via serial console to enter Wi‑Fi and MQTT settings, saved to NVS.
 - Reset button clears saved configuration at boot (GPIO configured by `CONFIG_RESET_BUTTON_GPIO`).
@@ -27,11 +26,10 @@ This repository contains the "Interactive MQTT Sensor" firmware for ESP-IDF. The
 	- Example requests:
 		- `Metrics/Temp/<device_id>` with payload `get` — request temperature
 		- `Metrics/HUMIDITY/<device_id>` — request humidity
-		- `Metrics/PRESSURE/<device_id>` — request pressure
-		- `Metrics/ALTITUDE/<device_id>` — request altitude (computed from pressure)
+		- (Note: requests for `PRESSURE` or `ALTITUDE` return `"not_supported"`)
 - The device subscribes to `Metrics/+/<device_id>` and replies on the same topic.
-- Request payload should be `get` (or empty/`1` for compatibility). JSON payloads are treate d as responses and ignored to avoid MQTT feedback loops.
-- Response payloads are JSON objects with `type` and `data` fields, where `data` contains the numeric value or the string `"read_error"` on failure.
+- Request payload should be `get` (or empty/`1` for compatibility). JSON payloads are treated as responses and ignored to avoid MQTT feedback loops.
+- Response payloads are JSON objects with `type` and `data` fields, where `data` contains the numeric value, `"not_supported"`, or the string `"read_error"` on failure.
 
 ## OTA Over MQTT
 

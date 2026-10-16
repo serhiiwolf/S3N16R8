@@ -302,24 +302,8 @@ static void handle_metrics_topic(const char *topic, int topic_len, const char *p
         } else {
             mqtt_publish_json_to_topic(topic, topic_len, "HUMIDITY", "\"read_error\"");
         }
-    } else if (strcmp(metric, "PRESSURE") == 0) {
-        float pressure_hpa = 0.0f;
-        if (sensor_read_pressure(&pressure_hpa) == ESP_OK) {
-            char data_json[32];
-            snprintf(data_json, sizeof(data_json), "%.*f", 2, pressure_hpa);
-            mqtt_publish_json_to_topic(topic, topic_len, "PRESSURE", data_json);
-        } else {
-            mqtt_publish_json_to_topic(topic, topic_len, "PRESSURE", "\"read_error\"");
-        }
-    } else if (strcmp(metric, "ALTITUDE") == 0) {
-        float altitude_m = 0.0f;
-        if (sensor_read_altitude(&altitude_m) == ESP_OK) {
-            char data_json[32];
-            snprintf(data_json, sizeof(data_json), "%.*f", 2, altitude_m);
-            mqtt_publish_json_to_topic(topic, topic_len, "ALTITUDE", data_json);
-        } else {
-            mqtt_publish_json_to_topic(topic, topic_len, "ALTITUDE", "\"read_error\"");
-        }
+    } else if (strcmp(metric, "PRESSURE") == 0 || strcmp(metric, "ALTITUDE") == 0) {
+        mqtt_publish_json_to_topic(topic, topic_len, metric, "\"not_supported\"");
     } else {
         ESP_LOGW(TAG, "Unknown metric requested: %s", metric);
     }
