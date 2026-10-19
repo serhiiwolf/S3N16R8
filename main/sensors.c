@@ -1,320 +1,229 @@
-#include <math.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <string.h>
 
-#include "driver/i2c_master.h"
+#include "driver/gpio.h"
+#include "esp_err.h"
 #include "esp_log.h"
+#include "esp_rom_sys.h"
+#include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
 #include "sensors.h"
 
-#define APP_I2C_SDA_GPIO     8
-#define APP_I2C_SCL_GPIO     9
-#define APP_I2C_FREQ_HZ      100000
+/*
+ * Sensor: V182 (DHT11 / DHT22 / AM2302 single-wire digital temperature & humidity sensor)
+ * Pinout:
+ *   '+'   -> 3.3V (or 5V)
+ *   'out' -> GPIO 8
+ *   '-'   -> GND
+ */
+#define APP_DHT_DATA_GPIO 8
 
-#define AHT20_ADDR           0x38
-#define BMP280_ADDR_PRIMARY  0x76
-#define BMP280_ADDR_SECONDARY 0x77
+static const char *TAG = "v182_sensor";
 
-typedef struct {
-    uint16_t dig_t1;
-    int16_t dig_t2;
-    int16_t dig_t3;
-    uint16_t dig_p1;
-    int16_t dig_p2;
-    int16_t dig_p3;
-    int16_t dig_p4;
-    int16_t dig_p5;
-    int16_t dig_p6;
-    int16_t dig_p7;
-    int16_t dig_p8;
-    int16_t dig_p9;
-    int32_t t_fine;
-} bmp280_calib_t;
+static portMUX_TYPE s_dht_mux = portMUX_INITIALIZER_UNLOCKED;
+static bool s_sensors_initialized = false;
 
-typedef struct {
-    i2c_master_bus_handle_t bus;
-    i2c_master_dev_handle_t aht20;
-    i2c_master_dev_handle_t bmp280;
-    uint8_t bmp280_address;
-    bmp280_calib_t bmp280_calib;
-    bool initialized;
-} sensor_context_t;
+// Caching: DHT sensors cannot be read faster than every 1-2 seconds.
+// Caching avoids read errors when Temp and HUMIDITY are requested sequentially over MQTT.
+static bool s_cache_valid = false;
+static int64_t s_last_read_time = 0;
+static float s_cached_temp = 0.0f;
+static float s_cached_hum = 0.0f;
 
-static const char *TAG = "interactive_mqtt";
-static sensor_context_t s_sensors;
-
-static uint16_t read_u16_le(const uint8_t *data)
+static int wait_level(gpio_num_t pin, int level, uint32_t timeout_us)
 {
-    return (uint16_t)data[0] | ((uint16_t)data[1] << 8);
-}
-
-static int16_t read_s16_le(const uint8_t *data)
-{
-    return (int16_t)read_u16_le(data);
-}
-
-static esp_err_t i2c_write_reg(i2c_master_dev_handle_t dev, uint8_t reg, uint8_t value)
-{
-    uint8_t buffer[2] = { reg, value };
-    return i2c_master_transmit(dev, buffer, sizeof(buffer), 100);
-}
-
-static esp_err_t i2c_read_reg(i2c_master_dev_handle_t dev, uint8_t reg, uint8_t *data, size_t len)
-{
-    return i2c_master_transmit_receive(dev, &reg, 1, data, len, 100);
-}
-
-static esp_err_t aht20_init(i2c_master_dev_handle_t dev)
-{
-    const uint8_t init_cmd[] = { 0xBE, 0x08, 0x00 };
-    esp_err_t err = i2c_master_transmit(dev, init_cmd, sizeof(init_cmd), 100);
-    if (err != ESP_OK) {
-        return err;
+    int64_t start = esp_timer_get_time();
+    while (gpio_get_level(pin) != level) {
+        if ((esp_timer_get_time() - start) > timeout_us) {
+            return -1;
+        }
     }
+    return (int)(esp_timer_get_time() - start);
+}
 
+static esp_err_t dht_read_raw(gpio_num_t pin, uint8_t data[5])
+{
+    memset(data, 0, 5);
+
+    // 1. Send start signal: LOW for at least 18-20ms
+    gpio_set_direction(pin, GPIO_MODE_OUTPUT);
+    gpio_set_level(pin, 0);
     vTaskDelay(pdMS_TO_TICKS(20));
-    return ESP_OK;
+
+    // Pull HIGH for 30us before switching to input
+    gpio_set_level(pin, 1);
+    esp_rom_delay_us(30);
+
+    // Switch to input with pullup enabled
+    gpio_set_direction(pin, GPIO_MODE_INPUT);
+    gpio_set_pull_mode(pin, GPIO_PULLUP_ONLY);
+
+    // 2. Measure response and 40 data bits inside critical section to avoid FreeRTOS preemption
+    esp_err_t result = ESP_OK;
+    portENTER_CRITICAL(&s_dht_mux);
+
+    // Wait for sensor response: LOW (~80us) -> HIGH (~80us) -> LOW (start of data)
+    if (wait_level(pin, 0, 100) < 0 ||
+        wait_level(pin, 1, 100) < 0 ||
+        wait_level(pin, 0, 100) < 0) {
+        result = ESP_ERR_TIMEOUT;
+        goto cleanup;
+    }
+
+    // 3. Read 40 data bits
+    for (int i = 0; i < 40; i++) {
+        // Wait for bit start (LOW -> HIGH)
+        if (wait_level(pin, 1, 100) < 0) {
+            result = ESP_ERR_TIMEOUT;
+            goto cleanup;
+        }
+
+        // Measure HIGH duration (HIGH -> LOW)
+        int high_duration = wait_level(pin, 0, 120);
+        if (high_duration < 0) {
+            result = ESP_ERR_TIMEOUT;
+            goto cleanup;
+        }
+
+        // '0' is ~26-28us, '1' is ~70us. Threshold is ~45us.
+        if (high_duration > 45) {
+            data[i / 8] |= (1 << (7 - (i % 8)));
+        }
+    }
+
+cleanup:
+    portEXIT_CRITICAL(&s_dht_mux);
+    return result;
 }
 
-static esp_err_t aht20_read(i2c_master_dev_handle_t dev, float *temperature_c, float *humidity_rh)
+static bool dht_decode(const uint8_t data[5], float *temperature_c, float *humidity_rh)
 {
-    const uint8_t measure_cmd[] = { 0xAC, 0x33, 0x00 };
-    uint8_t data[7] = { 0 };
-
-    esp_err_t err = i2c_master_transmit(dev, measure_cmd, sizeof(measure_cmd), 100);
-    if (err != ESP_OK) {
-        return err;
+    uint8_t sum = (data[0] + data[1] + data[2] + data[3]) & 0xFF;
+    if (sum != data[4]) {
+        ESP_LOGW(TAG, "V182 checksum mismatch: got 0x%02x, calculated 0x%02x (raw: %02x %02x %02x %02x %02x)",
+                 data[4], sum, data[0], data[1], data[2], data[3], data[4]);
+        return false;
     }
 
-    vTaskDelay(pdMS_TO_TICKS(80));
-    err = i2c_master_receive(dev, data, sizeof(data), 100);
-    if (err != ESP_OK) {
-        return err;
+    // Decode as DHT22 / AM2302
+    float dht22_h = (float)(((uint16_t)data[0] << 8) | data[1]) * 0.1f;
+    float dht22_t = (float)(((uint16_t)(data[2] & 0x7F) << 8) | data[3]) * 0.1f;
+    if (data[2] & 0x80) {
+        dht22_t = -dht22_t;
     }
 
-    uint32_t raw_humidity = ((uint32_t)data[1] << 12) | ((uint32_t)data[2] << 4) | (data[3] >> 4);
-    uint32_t raw_temperature = (((uint32_t)data[3] & 0x0F) << 16) | ((uint32_t)data[4] << 8) | data[5];
-
-    if (humidity_rh != NULL) {
-        *humidity_rh = (float)raw_humidity * 100.0f / 1048576.0f;
+    // Decode as DHT11
+    float dht11_h = (float)data[0] + (float)data[1] * 0.1f;
+    float dht11_t = (float)(data[2] & 0x7F) + (float)data[3] * 0.1f;
+    if (data[2] & 0x80) {
+        dht11_t = -dht11_t;
     }
 
-    if (temperature_c != NULL) {
-        *temperature_c = (float)raw_temperature * 200.0f / 1048576.0f - 50.0f;
+    // Auto-detect DHT22 vs DHT11:
+    // In DHT22, humidity is (data[0]<<8 | data[1]) / 10, so data[0] is typically 0..3 for 0..100% RH.
+    // In DHT11, data[0] is integer percentage (typically 20..90%).
+    // Also in DHT11, fractional bytes data[1] and data[3] are 0..9. If data[1] > 9, it is definitely DHT22.
+    if (dht22_h >= 0.0f && dht22_h <= 100.0f && dht22_t >= -40.0f && dht22_t <= 80.0f &&
+        (data[0] <= 4 || data[1] > 9 || data[3] > 9)) {
+        if (humidity_rh) *humidity_rh = dht22_h;
+        if (temperature_c) *temperature_c = dht22_t;
+        ESP_LOGD(TAG, "Decoded as DHT22: T=%.1f C, H=%.1f %%", dht22_t, dht22_h);
+        return true;
     }
 
-    return ESP_OK;
+    if (dht11_h >= 0.0f && dht11_h <= 100.0f && dht11_t >= 0.0f && dht11_t <= 60.0f) {
+        if (humidity_rh) *humidity_rh = dht11_h;
+        if (temperature_c) *temperature_c = dht11_t;
+        ESP_LOGD(TAG, "Decoded as DHT11: T=%.1f C, H=%.1f %%", dht11_t, dht11_h);
+        return true;
+    }
+
+    if (dht22_h >= 0.0f && dht22_h <= 100.0f) {
+        if (humidity_rh) *humidity_rh = dht22_h;
+        if (temperature_c) *temperature_c = dht22_t;
+        return true;
+    }
+
+    return false;
 }
 
-static esp_err_t bmp280_read_calibration(i2c_master_dev_handle_t dev, bmp280_calib_t *calib)
+static esp_err_t read_dht_cached(float *out_temp, float *out_hum)
 {
-    uint8_t data[24] = { 0 };
-    esp_err_t err = i2c_read_reg(dev, 0x88, data, sizeof(data));
+    int64_t now = esp_timer_get_time();
+    // Cache is valid for 2 seconds (2,000,000 us)
+    if (s_cache_valid && (now - s_last_read_time) >= 0 && (now - s_last_read_time) < 2000000) {
+        if (out_temp) *out_temp = s_cached_temp;
+        if (out_hum) *out_hum = s_cached_hum;
+        return ESP_OK;
+    }
+
+    uint8_t data[5] = {0};
+    esp_err_t err = dht_read_raw(APP_DHT_DATA_GPIO, data);
     if (err != ESP_OK) {
-        return err;
+        // Retry once after 100ms
+        vTaskDelay(pdMS_TO_TICKS(100));
+        err = dht_read_raw(APP_DHT_DATA_GPIO, data);
+        if (err != ESP_OK) {
+            ESP_LOGW(TAG, "Failed to read V182 sensor on GPIO %d (err=0x%x)", APP_DHT_DATA_GPIO, err);
+            return err;
+        }
     }
 
-    calib->dig_t1 = read_u16_le(&data[0]);
-    calib->dig_t2 = read_s16_le(&data[2]);
-    calib->dig_t3 = read_s16_le(&data[4]);
-    calib->dig_p1 = read_u16_le(&data[6]);
-    calib->dig_p2 = read_s16_le(&data[8]);
-    calib->dig_p3 = read_s16_le(&data[10]);
-    calib->dig_p4 = read_s16_le(&data[12]);
-    calib->dig_p5 = read_s16_le(&data[14]);
-    calib->dig_p6 = read_s16_le(&data[16]);
-    calib->dig_p7 = read_s16_le(&data[18]);
-    calib->dig_p8 = read_s16_le(&data[20]);
-    calib->dig_p9 = read_s16_le(&data[22]);
-
-    return ESP_OK;
-}
-
-static float bmp280_compensate_temperature_c(bmp280_calib_t *calib, int32_t adc_temperature)
-{
-    int32_t var1 = ((((adc_temperature >> 3) - ((int32_t)calib->dig_t1 << 1))) * ((int32_t)calib->dig_t2)) >> 11;
-    int32_t var2 = (((((adc_temperature >> 4) - ((int32_t)calib->dig_t1)) * ((adc_temperature >> 4) - ((int32_t)calib->dig_t1))) >> 12) * ((int32_t)calib->dig_t3)) >> 14;
-    calib->t_fine = var1 + var2;
-
-    int32_t temperature = (calib->t_fine * 5 + 128) >> 8;
-    return (float)temperature / 100.0f;
-}
-
-static float bmp280_compensate_pressure_pa(bmp280_calib_t *calib, int32_t adc_pressure)
-{
-    int64_t var1 = ((int64_t)calib->t_fine) - 128000;
-    int64_t var2 = var1 * var1 * (int64_t)calib->dig_p6;
-    var2 = var2 + ((var1 * (int64_t)calib->dig_p5) << 17);
-    var2 = var2 + (((int64_t)calib->dig_p4) << 35);
-    var1 = ((var1 * var1 * (int64_t)calib->dig_p3) >> 8) + ((var1 * (int64_t)calib->dig_p2) << 12);
-    var1 = (((((int64_t)1) << 47) + var1) * ((int64_t)calib->dig_p1)) >> 33;
-
-    if (var1 == 0) {
-        return 0.0f;
+    float t = 0.0f;
+    float h = 0.0f;
+    if (!dht_decode(data, &t, &h)) {
+        ESP_LOGW(TAG, "Failed to decode V182 sensor data");
+        return ESP_ERR_INVALID_RESPONSE;
     }
 
-    int64_t pressure = 1048576 - adc_pressure;
-    pressure = (((pressure << 31) - var2) * 3125) / var1;
-    var1 = (((int64_t)calib->dig_p9) * (pressure >> 13) * (pressure >> 13)) >> 25;
-    var2 = (((int64_t)calib->dig_p8) * pressure) >> 19;
-    pressure = ((pressure + var1 + var2) >> 8) + (((int64_t)calib->dig_p7) << 4);
+    s_cached_temp = t;
+    s_cached_hum = h;
+    s_last_read_time = esp_timer_get_time();
+    s_cache_valid = true;
 
-    return (float)pressure / 256.0f;
-}
-
-static esp_err_t bmp280_init(i2c_master_dev_handle_t dev)
-{
-    uint8_t chip_id = 0;
-    esp_err_t err = i2c_read_reg(dev, 0xD0, &chip_id, 1);
-    if (err != ESP_OK) {
-        return err;
-    }
-
-    if (chip_id != 0x58) {
-        ESP_LOGW(TAG, "Unexpected BMP280 chip id: 0x%02x", chip_id);
-    }
-
-    err = bmp280_read_calibration(dev, &s_sensors.bmp280_calib);
-    if (err != ESP_OK) {
-        return err;
-    }
-
-    err = i2c_write_reg(dev, 0xF5, 0x00);
-    if (err != ESP_OK) {
-        return err;
-    }
-
-    return ESP_OK;
-}
-
-static esp_err_t bmp280_read(i2c_master_dev_handle_t dev, float *temperature_c, float *pressure_hpa)
-{
-    esp_err_t err = i2c_write_reg(dev, 0xF4, 0x25);
-    if (err != ESP_OK) {
-        return err;
-    }
-
-    vTaskDelay(pdMS_TO_TICKS(10));
-
-    uint8_t data[6] = { 0 };
-    err = i2c_read_reg(dev, 0xF7, data, sizeof(data));
-    if (err != ESP_OK) {
-        return err;
-    }
-
-    int32_t adc_pressure = ((int32_t)data[0] << 12) | ((int32_t)data[1] << 4) | (data[2] >> 4);
-    int32_t adc_temperature = ((int32_t)data[3] << 12) | ((int32_t)data[4] << 4) | (data[5] >> 4);
-
-    if (temperature_c != NULL) {
-        *temperature_c = bmp280_compensate_temperature_c(&s_sensors.bmp280_calib, adc_temperature);
-    } else {
-        (void)bmp280_compensate_temperature_c(&s_sensors.bmp280_calib, adc_temperature);
-    }
-
-    if (pressure_hpa != NULL) {
-        float pressure_pa = bmp280_compensate_pressure_pa(&s_sensors.bmp280_calib, adc_pressure);
-        *pressure_hpa = pressure_pa / 100.0f;
-    }
-
+    if (out_temp) *out_temp = t;
+    if (out_hum) *out_hum = h;
     return ESP_OK;
 }
 
 esp_err_t sensor_init(void)
 {
-    memset(&s_sensors, 0, sizeof(s_sensors));
+    s_cache_valid = false;
+    s_last_read_time = 0;
 
-    i2c_master_bus_config_t bus_cfg = {
-        .i2c_port = I2C_NUM_0,
-        .sda_io_num = APP_I2C_SDA_GPIO,
-        .scl_io_num = APP_I2C_SCL_GPIO,
-        .clk_source = I2C_CLK_SRC_DEFAULT,
-        .glitch_ignore_cnt = 7,
-        .intr_priority = 0,
-        .trans_queue_depth = 0,
-        .flags = {
-            .enable_internal_pullup = 1,
-            .allow_pd = 0,
-        },
+    gpio_config_t io_conf = {
+        .pin_bit_mask = (1ULL << APP_DHT_DATA_GPIO),
+        .mode = GPIO_MODE_INPUT,
+        .pull_up_en = GPIO_PULLUP_ENABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE,
     };
-
-    ESP_ERROR_CHECK(i2c_new_master_bus(&bus_cfg, &s_sensors.bus));
-
-    i2c_device_config_t aht20_cfg = {
-        .dev_addr_length = I2C_ADDR_BIT_LEN_7,
-        .device_address = AHT20_ADDR,
-        .scl_speed_hz = APP_I2C_FREQ_HZ,
-        .scl_wait_us = 0,
-        .flags = {
-            .disable_ack_check = 0,
-        },
-    };
-    ESP_ERROR_CHECK(i2c_master_bus_add_device(s_sensors.bus, &aht20_cfg, &s_sensors.aht20));
-    ESP_ERROR_CHECK(i2c_master_probe(s_sensors.bus, AHT20_ADDR, 100));
-    ESP_ERROR_CHECK(aht20_init(s_sensors.aht20));
-
-    uint8_t bmp280_address = BMP280_ADDR_PRIMARY;
-    if (i2c_master_probe(s_sensors.bus, bmp280_address, 100) != ESP_OK) {
-        bmp280_address = BMP280_ADDR_SECONDARY;
+    esp_err_t err = gpio_config(&io_conf);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to configure GPIO %d for V182 sensor: %s", APP_DHT_DATA_GPIO, esp_err_to_name(err));
+        return err;
     }
 
-    ESP_ERROR_CHECK(i2c_master_probe(s_sensors.bus, bmp280_address, 100));
-    s_sensors.bmp280_address = bmp280_address;
-
-    i2c_device_config_t bmp280_cfg = {
-        .dev_addr_length = I2C_ADDR_BIT_LEN_7,
-        .device_address = bmp280_address,
-        .scl_speed_hz = APP_I2C_FREQ_HZ,
-        .scl_wait_us = 0,
-        .flags = {
-            .disable_ack_check = 0,
-        },
-    };
-    ESP_ERROR_CHECK(i2c_master_bus_add_device(s_sensors.bus, &bmp280_cfg, &s_sensors.bmp280));
-    ESP_ERROR_CHECK(bmp280_init(s_sensors.bmp280));
-
-    s_sensors.initialized = true;
-    ESP_LOGI(TAG, "Sensors initialized: AHT20 at 0x38, BMP280 at 0x%02x", bmp280_address);
+    s_sensors_initialized = true;
+    ESP_LOGI(TAG, "V182 (DHT) sensor initialized on GPIO %d (Wiring: '+' -> 3.3V, 'out' -> GPIO %d, '-' -> GND)",
+             APP_DHT_DATA_GPIO, APP_DHT_DATA_GPIO);
     return ESP_OK;
 }
 
 bool sensor_is_initialized(void)
 {
-    return s_sensors.initialized;
+    return s_sensors_initialized;
 }
 
 esp_err_t sensor_read_temperature(float *temperature_c)
 {
-    return aht20_read(s_sensors.aht20, temperature_c, NULL);
+    return read_dht_cached(temperature_c, NULL);
 }
 
 esp_err_t sensor_read_humidity(float *humidity_rh)
 {
-    return aht20_read(s_sensors.aht20, NULL, humidity_rh);
-}
-
-esp_err_t sensor_read_pressure(float *pressure_hpa)
-{
-    return bmp280_read(s_sensors.bmp280, NULL, pressure_hpa);
-}
-
-esp_err_t sensor_read_altitude(float *altitude_m)
-{
-    float pressure_hpa = 0.0f;
-    esp_err_t err = sensor_read_pressure(&pressure_hpa);
-    if (err != ESP_OK) {
-        return err;
-    }
-
-    if (pressure_hpa <= 0.0f) {
-        return ESP_FAIL;
-    }
-
-    if (altitude_m != NULL) {
-        *altitude_m = 44330.0f * (1.0f - powf(pressure_hpa / 1013.25f, 0.1903f));
-    }
-
-    return ESP_OK;
+    return read_dht_cached(NULL, humidity_rh);
 }

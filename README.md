@@ -1,37 +1,49 @@
 | Supported Targets | ESP32 | ESP32-C2 | ESP32-C3 | ESP32-C5 | ESP32-C6 | ESP32-C61 | ESP32-H2 | ESP32-H21 | ESP32-H4 | ESP32-P4 | ESP32-S2 | ESP32-S3 | Linux |
 | ----------------- | ----- | -------- | -------- | -------- | -------- | --------- | -------- | --------- | -------- | -------- | -------- | -------- | ----- |
 
-# Interactive MQTT Sensor
+# Interactive MQTT Sensor (V182 Sensor Variant)
 
-ESP-IDF project for an interactive MQTT sensor node.
-
-(See the README.md file in the upper level 'examples' directory for more information about examples.)
+ESP-IDF project for an interactive MQTT sensor node supporting the **V182** digital temperature and humidity sensor (DHT11 / DHT22 / AM2302 module with 3-pin interface).
 
 ## Overview
 
-This repository contains the "Interactive MQTT Sensor" firmware for ESP-IDF. The firmware reads environmental sensors over I2C and exposes their values via MQTT on demand. It is intended for development boards with an AHT20 (temperature & humidity) and a BMP280 (pressure) connected on the I2C bus.
+This repository contains the "Interactive MQTT Sensor" firmware for ESP-IDF adapted for the **V182** sensor module (3-pin: `+`, `out`, `-`). The firmware reads temperature and relative humidity over a single-wire digital protocol and exposes their values via MQTT on demand.
 
 ## Features
 
-- Reads temperature and humidity from AHT20.
-- Reads pressure (and computes altitude) from BMP280.
+- Reads temperature and humidity from the 3-pin **V182** sensor (auto-detects DHT11 and DHT22/AM2302 formats).
+- Includes read caching (2 seconds) to avoid sensor rate-limiting when requesting temperature and humidity sequentially.
 - Connects to Wi‑Fi and an MQTT broker.
 - Interactive bootstrap via serial console to enter Wi‑Fi and MQTT settings, saved to NVS.
 - Reset button clears saved configuration at boot (GPIO configured by `CONFIG_RESET_BUTTON_GPIO`).
 - Subscribes to metric request topics under `Metrics/<metric>/<device_id>` and replies on the same topic with JSON payloads.
 - Supports OTA update over HTTPS, triggered by MQTT command.
 
+## Hardware Wiring
+
+The **V182** sensor module has 3 pins:
+
+| V182 Pin | ESP32-S3 Connection | Description |
+| :--- | :--- | :--- |
+| **`+`** | **3.3V** (or 5V) | Power supply |
+| **`out`** | **GPIO 8** | Single-wire digital data signal |
+| **`-`** | **GND** | Ground |
+
+*Reset button:* GPIO 4 (active low / pull-to-GND to reset configuration).
+
 ## MQTT Topics
 
 - Request metric values by publishing to: `Metrics/<metric>/<device_id>`
 	- Example requests:
-		- `Metrics/Temp/<device_id>` with payload `get` — request temperature
-		- `Metrics/HUMIDITY/<device_id>` — request humidity
-		- `Metrics/PRESSURE/<device_id>` — request pressure
-		- `Metrics/ALTITUDE/<device_id>` — request altitude (computed from pressure)
+		- `Metrics/Temp/<device_id>` with payload `get` — request temperature in °C
+		- `Metrics/HUMIDITY/<device_id>` — request relative humidity in %
+		- (Note: requests for `PRESSURE` or `ALTITUDE` return `"not_supported"`)
 - The device subscribes to `Metrics/+/<device_id>` and replies on the same topic.
-- Request payload should be `get` (or empty/`1` for compatibility). JSON payloads are treate d as responses and ignored to avoid MQTT feedback loops.
-- Response payloads are JSON objects with `type` and `data` fields, where `data` contains the numeric value or the string `"read_error"` on failure.
+- Request payload should be `get` (or empty/`1` for compatibility). JSON payloads are treated as responses and ignored to avoid MQTT feedback loops.
+- Response payloads are JSON objects with `type` and `data` fields:
+  - Success: `{"type":"Temp","data":23.5}` or `{"type":"HUMIDITY","data":45.2}`
+  - Error: `{"type":"Temp","data":"read_error"}`
+  - Unsupported: `{"type":"PRESSURE","data":"not_supported"}`
 
 ## OTA Over MQTT
 
@@ -54,14 +66,6 @@ Notes:
 	- MQTT client id, username, password, and device id
 - The settings are stored in NVS under namespace `appcfg` so the device reconnects automatically on next boot.
 
-## Hardware
-
-- I2C SDA: GPIO 8
-- I2C SCL: GPIO 9
-- Reset button: GPIO defined by `CONFIG_RESET_BUTTON_GPIO` (default in project config)
-
-Refer to the firmware entrypoint and implementation: [main/interactive_mqtt_sensor_main.c](main/interactive_mqtt_sensor_main.c#L1-L999).
-
 ## Build and Flash
 
 Build and flash using the ESP-IDF tooling from the project root:
@@ -72,27 +76,11 @@ idf.py -p PORT flash
 idf.py -p PORT monitor
 ```
 
-Replace `PORT` with your serial port (example: `COM3` on Windows).
+Replace `PORT` with your serial port (example: `COM5` on Windows).
 
 ## Project files
 
 - [CMakeLists.txt](CMakeLists.txt#L1) — top-level build config
-- [main/interactive_mqtt_sensor_main.c](main/interactive_mqtt_sensor_main.c#L1) — firmware source
-
-If you need more details on ESP-IDF project structure and building, see the ESP-IDF Programming Guide: https://docs.espressif.com/projects/esp-idf/en/latest/esp32/get-started/
-
-## Troubleshooting
-
-* Program upload failure
-
-	* Hardware connection is not correct: run `idf.py -p PORT monitor`, and reboot your board to see if there are any output logs.
-	* The baud rate for downloading is too high: lower your baud rate in the `menuconfig` menu, and try again.
-
-## Technical support and feedback
-
-Please use the following feedback channels:
-
-* For technical queries, go to the [esp32.com](https://esp32.com/) forum
-* For a feature request or bug report, create a [GitHub issue](https://github.com/espressif/esp-idf/issues)
-
-We will get back to you as soon as possible.
+- [main/interactive_mqtt_sensor_main.c](main/interactive_mqtt_sensor_main.c#L1) — firmware entrypoint
+- [main/sensors.c](main/sensors.c#L1) — V182 (DHT11/DHT22) single-wire driver
+- [main/connectivity.c](main/connectivity.c#L1) — Wi-Fi, MQTT, and OTA handling
