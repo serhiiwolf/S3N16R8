@@ -127,21 +127,58 @@ esp_err_t app_load_user_config(app_user_config_t *cfg)
         return err;
     }
 
-    size_t required_size = sizeof(*cfg);
-    err = nvs_get_blob(handle, NVS_KEY_CFG, cfg, &required_size);
-    nvs_close(handle);
-
+    size_t required_size = 0;
+    err = nvs_get_blob(handle, NVS_KEY_CFG, NULL, &required_size);
     if (err != ESP_OK) {
+        nvs_close(handle);
         return err;
     }
 
-    if (required_size != sizeof(*cfg)) {
+    if (required_size == sizeof(app_user_config_v1_t)) {
+        app_user_config_v1_t v1 = {0};
+        err = nvs_get_blob(handle, NVS_KEY_CFG, &v1, &required_size);
+        nvs_close(handle);
+        if (err != ESP_OK) {
+            return err;
+        }
+
+        memset(cfg, 0, sizeof(*cfg));
+        strncpy(cfg->wifi_ssid, v1.wifi_ssid, sizeof(cfg->wifi_ssid) - 1);
+        strncpy(cfg->wifi_password, v1.wifi_password, sizeof(cfg->wifi_password) - 1);
+        strncpy(cfg->broker_uri, v1.broker_uri, sizeof(cfg->broker_uri) - 1);
+        strncpy(cfg->mqtt_client_id, v1.mqtt_client_id, sizeof(cfg->mqtt_client_id) - 1);
+        strncpy(cfg->device_id, v1.device_id, sizeof(cfg->device_id) - 1);
+    } else if (required_size == sizeof(app_user_config_t)) {
+        err = nvs_get_blob(handle, NVS_KEY_CFG, cfg, &required_size);
+        nvs_close(handle);
+        if (err != ESP_OK) {
+            return err;
+        }
+    } else {
+        nvs_close(handle);
+        ESP_LOGE(TAG, "NVS blob size mismatch: expected %d or %d, got %d",
+                 (int)sizeof(app_user_config_t), (int)sizeof(app_user_config_v1_t), (int)required_size);
         return ESP_ERR_NVS_INVALID_LENGTH;
     }
 
-    if (strlen(cfg->wifi_ssid) == 0 || strlen(cfg->broker_uri) == 0 ||
-        strlen(cfg->mqtt_client_id) == 0 || strlen(cfg->mqtt_username) == 0 ||
-        strlen(cfg->mqtt_password) == 0) {
+    // Unify identifiers: device_id acts as default for client_id and username
+    if (cfg->device_id[0] == '\0') {
+        if (cfg->mqtt_client_id[0] != '\0') {
+            strncpy(cfg->device_id, cfg->mqtt_client_id, sizeof(cfg->device_id) - 1);
+        } else if (cfg->mqtt_username[0] != '\0') {
+            strncpy(cfg->device_id, cfg->mqtt_username, sizeof(cfg->device_id) - 1);
+        }
+    }
+
+    if (cfg->mqtt_client_id[0] == '\0' && cfg->device_id[0] != '\0') {
+        strncpy(cfg->mqtt_client_id, cfg->device_id, sizeof(cfg->mqtt_client_id) - 1);
+    }
+
+    if (cfg->mqtt_username[0] == '\0' && cfg->device_id[0] != '\0') {
+        strncpy(cfg->mqtt_username, cfg->device_id, sizeof(cfg->mqtt_username) - 1);
+    }
+
+    if (strlen(cfg->wifi_ssid) == 0 || strlen(cfg->broker_uri) == 0 || strlen(cfg->device_id) == 0) {
         return ESP_ERR_INVALID_STATE;
     }
 
@@ -186,20 +223,18 @@ bool app_read_user_config_interactive(app_user_config_t *cfg)
         return false;
     }
 
-    if (!read_line_required("MQTT Client ID: ", cfg->mqtt_client_id, sizeof(cfg->mqtt_client_id))) {
-        return false;
-    }
-
-    if (!read_line_required("MQTT Username: ", cfg->mqtt_username, sizeof(cfg->mqtt_username))) {
-        return false;
-    }
-
-    if (!read_line_required("MQTT Password: ", cfg->mqtt_password, sizeof(cfg->mqtt_password))) {
-        return false;
-    }
-
     if (!read_line_required("Device ID: ", cfg->device_id, sizeof(cfg->device_id))) {
         return false;
+    }
+
+    // Automatically assign Device ID as default Client ID and Username
+    strncpy(cfg->mqtt_client_id, cfg->device_id, sizeof(cfg->mqtt_client_id) - 1);
+    strncpy(cfg->mqtt_username, cfg->device_id, sizeof(cfg->mqtt_username) - 1);
+
+    printf("MQTT Password (press Enter if none): ");
+    fflush(stdout);
+    if (fgets(cfg->mqtt_password, sizeof(cfg->mqtt_password), stdin) != NULL) {
+        trim_newline(cfg->mqtt_password);
     }
 
     return true;

@@ -336,6 +336,7 @@ static void ota_update_task(void *arg)
         .url = job->url,
         .crt_bundle_attach = esp_crt_bundle_attach,
         .timeout_ms = 15000,
+        .max_redirection_count = 10,
         .keep_alive_enable = true,
     };
 
@@ -532,9 +533,9 @@ esp_err_t mqtt_start(const app_user_config_t *cfg)
     esp_mqtt_client_config_t mqtt_cfg = {
         .broker.address.uri = cfg->broker_uri,
         .broker.verification.crt_bundle_attach = esp_crt_bundle_attach,
-        .credentials.client_id = cfg->mqtt_client_id,
-        .credentials.username = cfg->mqtt_username,
-        .credentials.authentication.password = cfg->mqtt_password,
+        .credentials.client_id = cfg->mqtt_client_id[0] != '\0' ? cfg->mqtt_client_id : cfg->device_id,
+        .credentials.username = cfg->mqtt_username[0] != '\0' ? cfg->mqtt_username : cfg->device_id,
+        .credentials.authentication.password = cfg->mqtt_password[0] != '\0' ? cfg->mqtt_password : NULL,
         .network.disable_auto_reconnect = false,
     };
 
