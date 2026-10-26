@@ -7,6 +7,7 @@
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/semphr.h"
 
 #include "sensors.h"
 
@@ -45,6 +46,7 @@ typedef struct {
 
 static const char *TAG = "interactive_mqtt";
 static sensor_context_t s_sensors;
+static SemaphoreHandle_t s_sensor_mutex = NULL;
 
 static uint16_t read_u16_le(const uint8_t *data)
 {
@@ -225,6 +227,9 @@ static esp_err_t bmp280_read(i2c_master_dev_handle_t dev, float *temperature_c, 
 esp_err_t sensor_init(void)
 {
     memset(&s_sensors, 0, sizeof(s_sensors));
+    if (s_sensor_mutex == NULL) {
+        s_sensor_mutex = xSemaphoreCreateRecursiveMutex();
+    }
 
     i2c_master_bus_config_t bus_cfg = {
         .i2c_port = I2C_NUM_0,
@@ -287,34 +292,56 @@ bool sensor_is_initialized(void)
 
 esp_err_t sensor_read_temperature(float *temperature_c)
 {
-    return aht20_read(s_sensors.aht20, temperature_c, NULL);
+    if (s_sensor_mutex != NULL) {
+        xSemaphoreTakeRecursive(s_sensor_mutex, portMAX_DELAY);
+    }
+    esp_err_t err = aht20_read(s_sensors.aht20, temperature_c, NULL);
+    if (s_sensor_mutex != NULL) {
+        xSemaphoreGiveRecursive(s_sensor_mutex);
+    }
+    return err;
 }
 
 esp_err_t sensor_read_humidity(float *humidity_rh)
 {
-    return aht20_read(s_sensors.aht20, NULL, humidity_rh);
+    if (s_sensor_mutex != NULL) {
+        xSemaphoreTakeRecursive(s_sensor_mutex, portMAX_DELAY);
+    }
+    esp_err_t err = aht20_read(s_sensors.aht20, NULL, humidity_rh);
+    if (s_sensor_mutex != NULL) {
+        xSemaphoreGiveRecursive(s_sensor_mutex);
+    }
+    return err;
 }
 
 esp_err_t sensor_read_pressure(float *pressure_hpa)
 {
-    return bmp280_read(s_sensors.bmp280, NULL, pressure_hpa);
+    if (s_sensor_mutex != NULL) {
+        xSemaphoreTakeRecursive(s_sensor_mutex, portMAX_DELAY);
+    }
+    esp_err_t err = bmp280_read(s_sensors.bmp280, NULL, pressure_hpa);
+    if (s_sensor_mutex != NULL) {
+        xSemaphoreGiveRecursive(s_sensor_mutex);
+    }
+    return err;
 }
 
 esp_err_t sensor_read_altitude(float *altitude_m)
 {
+    if (s_sensor_mutex != NULL) {
+        xSemaphoreTakeRecursive(s_sensor_mutex, portMAX_DELAY);
+    }
     float pressure_hpa = 0.0f;
-    esp_err_t err = sensor_read_pressure(&pressure_hpa);
-    if (err != ESP_OK) {
-        return err;
+    esp_err_t err = bmp280_read(s_sensors.bmp280, NULL, &pressure_hpa);
+    if (err == ESP_OK) {
+        if (pressure_hpa <= 0.0f) {
+            err = ESP_FAIL;
+        } else if (altitude_m != NULL) {
+            *altitude_m = 44330.0f * (1.0f - powf(pressure_hpa / 1013.25f, 0.1903f));
+        }
     }
-
-    if (pressure_hpa <= 0.0f) {
-        return ESP_FAIL;
+    if (s_sensor_mutex != NULL) {
+        xSemaphoreGiveRecursive(s_sensor_mutex);
     }
-
-    if (altitude_m != NULL) {
-        *altitude_m = 44330.0f * (1.0f - powf(pressure_hpa / 1013.25f, 0.1903f));
-    }
-
-    return ESP_OK;
+    return err;
 }
