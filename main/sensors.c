@@ -6,11 +6,12 @@
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/semphr.h"
 
 #include "sensors.h"
 
-#define APP_I2C_SDA_GPIO     8
-#define APP_I2C_SCL_GPIO     9
+#define APP_I2C_SDA_GPIO     21
+#define APP_I2C_SCL_GPIO     22
 #define APP_I2C_FREQ_HZ      100000
 
 #define AHT20_ADDR           0x38
@@ -23,6 +24,7 @@ typedef struct {
 
 static const char *TAG = "interactive_mqtt";
 static sensor_context_t s_sensors;
+static SemaphoreHandle_t s_sensor_mutex = NULL;
 
 static esp_err_t aht20_init(i2c_master_dev_handle_t dev)
 {
@@ -70,6 +72,10 @@ esp_err_t sensor_init(void)
 {
     memset(&s_sensors, 0, sizeof(s_sensors));
 
+    if (s_sensor_mutex == NULL) {
+        s_sensor_mutex = xSemaphoreCreateRecursiveMutex();
+    }
+
     i2c_master_bus_config_t bus_cfg = {
         .i2c_port = I2C_NUM_0,
         .sda_io_num = APP_I2C_SDA_GPIO,
@@ -100,7 +106,7 @@ esp_err_t sensor_init(void)
     ESP_ERROR_CHECK(aht20_init(s_sensors.aht20));
 
     s_sensors.initialized = true;
-    ESP_LOGI(TAG, "Sensor initialized: AHT20 at 0x38");
+    ESP_LOGI(TAG, "Sensor initialized: AHT20 at 0x38 (SDA: %d, SCL: %d)", APP_I2C_SDA_GPIO, APP_I2C_SCL_GPIO);
     return ESP_OK;
 }
 
@@ -111,10 +117,24 @@ bool sensor_is_initialized(void)
 
 esp_err_t sensor_read_temperature(float *temperature_c)
 {
-    return aht20_read(s_sensors.aht20, temperature_c, NULL);
+    if (s_sensor_mutex != NULL) {
+        xSemaphoreTakeRecursive(s_sensor_mutex, portMAX_DELAY);
+    }
+    esp_err_t err = aht20_read(s_sensors.aht20, temperature_c, NULL);
+    if (s_sensor_mutex != NULL) {
+        xSemaphoreGiveRecursive(s_sensor_mutex);
+    }
+    return err;
 }
 
 esp_err_t sensor_read_humidity(float *humidity_rh)
 {
-    return aht20_read(s_sensors.aht20, NULL, humidity_rh);
+    if (s_sensor_mutex != NULL) {
+        xSemaphoreTakeRecursive(s_sensor_mutex, portMAX_DELAY);
+    }
+    esp_err_t err = aht20_read(s_sensors.aht20, NULL, humidity_rh);
+    if (s_sensor_mutex != NULL) {
+        xSemaphoreGiveRecursive(s_sensor_mutex);
+    }
+    return err;
 }

@@ -11,6 +11,8 @@
 #include "esp_ota_ops.h"
 #include "esp_system.h"
 #include "esp_wifi.h"
+#include "esp_timer.h"
+#include <math.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/event_groups.h"
 #include "freertos/task.h"
@@ -42,6 +44,15 @@ static bool s_wifi_connected_once = false;
 static bool s_ota_in_progress = false;
 static app_user_config_t s_user_cfg;
 static esp_mqtt_client_handle_t s_mqtt_client;
+#define TELEMETRY_POLL_INTERVAL_MS   3000
+#define TELEMETRY_DELTA_TEMP          0.3f
+#define TELEMETRY_DELTA_HUMIDITY      1.5f
+#define TELEMETRY_MIN_INTERVAL_SEC    10
+#define TELEMETRY_MAX_INTERVAL_SEC    300
+
+static TaskHandle_t s_telemetry_task_handle = NULL;
+static bool s_telemetry_force_initial = false;
+
 
 static void mqtt_publish_json_to_topic(const char *topic, int topic_len, const char *type, const char *data_json)
 {
@@ -320,6 +331,7 @@ static void ota_update_task(void *arg)
         .url = job->url,
         .crt_bundle_attach = esp_crt_bundle_attach,
         .timeout_ms = 15000,
+        .max_redirection_count = 10,
         .keep_alive_enable = true,
     };
 
@@ -402,6 +414,90 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base, int32_t e
     }
 }
 
+
+static void publish_metric_value(const char *metric, float value, int precision)
+{
+    char topic[128];
+    snprintf(topic, sizeof(topic), "%s/%s/%s", MQTT_TOPIC_METRICS_PREFIX, metric, s_user_cfg.device_id);
+    char data_json[32];
+    snprintf(data_json, sizeof(data_json), "%.*f", precision, value);
+    mqtt_publish_json_to_topic(topic, strlen(topic), metric, data_json);
+}
+
+static void telemetry_task(void *pvParameters)
+{
+    ESP_LOGI(TAG, "Proactive telemetry task started (AHT20-only)");
+
+    float last_temp = 0.0f;
+    float last_humidity = 0.0f;
+
+    int64_t last_temp_time_us = 0;
+    int64_t last_humidity_time_us = 0;
+
+    bool temp_initialized = false;
+    bool humidity_initialized = false;
+
+    while (1) {
+        vTaskDelay(pdMS_TO_TICKS(TELEMETRY_POLL_INTERVAL_MS));
+
+        if (s_mqtt_client == NULL || s_ota_in_progress || !sensor_is_initialized()) {
+            continue;
+        }
+
+        if (s_telemetry_force_initial) {
+            s_telemetry_force_initial = false;
+            temp_initialized = false;
+            humidity_initialized = false;
+        }
+
+        int64_t now_us = esp_timer_get_time();
+        int64_t min_interval_us = (int64_t)TELEMETRY_MIN_INTERVAL_SEC * 1000000LL;
+        int64_t max_interval_us = (int64_t)TELEMETRY_MAX_INTERVAL_SEC * 1000000LL;
+
+        // 1. Temperature
+        float cur_temp = 0.0f;
+        if (sensor_read_temperature(&cur_temp) == ESP_OK) {
+            bool should_send = false;
+            if (!temp_initialized) {
+                should_send = true;
+            } else if (now_us - last_temp_time_us >= max_interval_us) {
+                should_send = true;
+            } else if (fabsf(cur_temp - last_temp) >= TELEMETRY_DELTA_TEMP &&
+                       (now_us - last_temp_time_us >= min_interval_us)) {
+                should_send = true;
+            }
+
+            if (should_send) {
+                publish_metric_value("Temp", cur_temp, 2);
+                last_temp = cur_temp;
+                last_temp_time_us = now_us;
+                temp_initialized = true;
+            }
+        }
+
+        // 2. Humidity
+        float cur_hum = 0.0f;
+        if (sensor_read_humidity(&cur_hum) == ESP_OK) {
+            bool should_send = false;
+            if (!humidity_initialized) {
+                should_send = true;
+            } else if (now_us - last_humidity_time_us >= max_interval_us) {
+                should_send = true;
+            } else if (fabsf(cur_hum - last_humidity) >= TELEMETRY_DELTA_HUMIDITY &&
+                       (now_us - last_humidity_time_us >= min_interval_us)) {
+                should_send = true;
+            }
+
+            if (should_send) {
+                publish_metric_value("HUMIDITY", cur_hum, 2);
+                last_humidity = cur_hum;
+                last_humidity_time_us = now_us;
+                humidity_initialized = true;
+            }
+        }
+    }
+}
+
 static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_t event_id, void *event_data)
 {
     esp_mqtt_event_handle_t event = (esp_mqtt_event_handle_t)event_data;
@@ -411,6 +507,7 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
         case MQTT_EVENT_CONNECTED: {
             ESP_LOGI(TAG, "MQTT connected");
             s_mqtt_client = client;
+            s_telemetry_force_initial = true;
 
             char final_sub[128];
             snprintf(final_sub, sizeof(final_sub), "%s/+/%s", MQTT_TOPIC_METRICS_PREFIX, s_user_cfg.device_id);
@@ -516,9 +613,9 @@ esp_err_t mqtt_start(const app_user_config_t *cfg)
     esp_mqtt_client_config_t mqtt_cfg = {
         .broker.address.uri = cfg->broker_uri,
         .broker.verification.crt_bundle_attach = esp_crt_bundle_attach,
-        .credentials.client_id = cfg->mqtt_client_id,
-        .credentials.username = cfg->mqtt_username,
-        .credentials.authentication.password = cfg->mqtt_password,
+        .credentials.client_id = cfg->mqtt_client_id[0] != '\0' ? cfg->mqtt_client_id : cfg->device_id,
+        .credentials.username = cfg->mqtt_username[0] != '\0' ? cfg->mqtt_username : cfg->device_id,
+        .credentials.authentication.password = cfg->mqtt_password[0] != '\0' ? cfg->mqtt_password : NULL,
         .network.disable_auto_reconnect = false,
     };
 
@@ -530,6 +627,13 @@ esp_err_t mqtt_start(const app_user_config_t *cfg)
 
     ESP_ERROR_CHECK(esp_mqtt_client_register_event(client, ESP_EVENT_ANY_ID, mqtt_event_handler, NULL));
     ESP_ERROR_CHECK(esp_mqtt_client_start(client));
+
+    if (s_telemetry_task_handle == NULL) {
+        BaseType_t res = xTaskCreate(telemetry_task, "telemetry_task", 4096, NULL, 4, &s_telemetry_task_handle);
+        if (res != pdPASS) {
+            ESP_LOGE(TAG, "Failed to create telemetry task");
+        }
+    }
 
     return ESP_OK;
 }

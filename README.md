@@ -49,13 +49,14 @@ Notes:
 - On first boot (or after clearing NVS by holding the reset button on GPIO4 for at least 1 second at boot), the device enters an interactive console setup where you must provide:
 	- Wi‑Fi SSID and password
 	- Broker URI (e.g. `mqtt://192.168.1.10:1883` or `wss://broker.example.com:443/mqtt`)
-	- MQTT client id, username, password, and device id
+	- Device ID (used for topic filtering and as default MQTT client ID / username)
+	- MQTT password (optional)
 - The settings are stored in NVS under namespace `appcfg` so the device reconnects automatically on next boot.
 
 ## Hardware
 
-- I2C SDA: GPIO 8
-- I2C SCL: GPIO 9
+- I2C SDA: GPIO 21
+- I2C SCL: GPIO 22
 - Reset button: GPIO defined by `CONFIG_RESET_BUTTON_GPIO` (default in project config)
 
 Refer to the firmware entrypoint and implementation: [main/interactive_mqtt_sensor_main.c](main/interactive_mqtt_sensor_main.c#L1-L999).
